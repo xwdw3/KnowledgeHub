@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · 企业智能知识库</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/login.css">
+</head>
+<body class="login-body">
+
+<!-- 背景：三组缓慢漂移的光斑。
+     纯装饰，aria-hidden 让读屏软件跳过；
+     prefers-reduced-motion 下由 base.css 统一关掉动画。 -->
+<div class="bg-orbs" aria-hidden="true">
+  <span class="orb orb-a"></span>
+  <span class="orb orb-b"></span>
+  <span class="orb orb-c"></span>
+  <span class="grid-mask"></span>
+</div>
+
+<main class="login-shell">
+
+  <!-- 左栏：品牌与卖点。窄屏下整块隐藏（见 login.css 断点） -->
+  <section class="login-brand" aria-label="产品介绍">
+    <div class="brand-logo">
+      <svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">
+        <rect x="1" y="1" width="38" height="38" rx="11" fill="url(#lg)"/>
+        <path d="M12 11h11l5 5v13a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2V13a2 2 0 0 1 2-2z"
+              fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>
+        <path d="M22.5 11v5.5H28" fill="none" stroke="#fff" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M15 22h10M15 26h6" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+        <defs>
+          <linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#e86395"/><stop offset="1" stop-color="#ad3a66"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <div>
+        <div class="brand-name">企业智能知识库</div>
+        <div class="brand-sub">私有化 · RAG 检索增强</div>
+      </div>
+    </div>
+
+    <h1 class="brand-headline">
+      把散落的制度与资料<br>变成<span class="hl">随手可问</span>的知识
+    </h1>
+    <p class="brand-desc">
+      文档解析 → 切片 → 向量化 → 混合检索 → 重排 → 大模型作答，
+      全程在您的内网完成。答案附带原文出处，可逐句核对。
+    </p>
+
+    <ul class="feature-list">
+      <li>
+        <span class="fi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/>
+          </svg>
+        </span>
+        <div>
+          <strong>数据不出内网</strong>
+          <span>向量库、业务库、对象存储全部自托管</span>
+        </div>
+      </li>
+      <li>
+        <span class="fi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+          </svg>
+        </span>
+        <div>
+          <strong>混合检索 + 重排</strong>
+          <span>向量与关键词双路召回，RRF 融合后二次精排</span>
+        </div>
+      </li>
+      <li>
+        <span class="fi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7h7v7H3zM14 7h7v4h-7zM14 14h7v3h-7zM3 17h7v4H3z"/>
+          </svg>
+        </span>
+        <div>
+          <strong>三层权限隔离</strong>
+          <span>租户 → 空间 → 密级，逐层下推到检索</span>
+        </div>
+      </li>
+    </ul>
+
+    <p class="brand-foot mono">P4 · 多租户 / 异步队列 / MinIO / ELK / SSO</p>
+  </section>
+
+  <!-- 右栏：登录表单 -->
+  <section class="login-panel">
+    <div class="panel-inner">
+      <div class="panel-head">
+        <h2>欢迎回来</h2>
+        <p class="muted">请使用企业账号登录</p>
+      </div>
+
+      <!-- 单点登录按钮：由 /auth/methods 决定是否显示 -->
+      <button class="btn btn-ghost btn-block sso-btn hidden" id="ssoBtn" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+          <path d="M10 17l5-5-5-5"/><path d="M15 12H3"/>
+        </svg>
+        <span id="ssoText">使用企业账号登录（SSO）</span>
+      </button>
+      <div class="divider hidden" id="ssoDivider"><span>或使用账号密码</span></div>
+
+      <form id="loginForm" novalidate autocomplete="on">
+        <div class="field">
+          <label for="tenant">企业租户<span class="label-note" id="tenantNote">可留空</span></label>
+          <input class="input" id="tenant" name="tenant_id" type="text"
+                 maxlength="64" placeholder="例如 acme" autocomplete="organization">
+        </div>
+
+        <div class="field">
+          <label for="username">用户名</label>
+          <input class="input" id="username" name="username" type="text"
+                 required maxlength="128" placeholder="请输入用户名"
+                 autocomplete="username" autofocus>
+        </div>
+
+        <div class="field">
+          <label for="password">密码</label>
+          <div class="pwd-wrap">
+            <input class="input" id="password" name="password" type="password"
+                   required maxlength="128" placeholder="请输入密码" autocomplete="current-password">
+            <button class="pwd-toggle" id="pwdToggle" type="button"
+                    aria-label="显示密码" aria-pressed="false">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="checkbox">
+            <input type="checkbox" id="remember" checked>
+            <span>记住用户名</span>
+          </label>
+          <a href="#" class="forgot" id="forgotLink">忘记密码？</a>
+        </div>
+
+        <!-- 错误区：role="alert" 让读屏软件在内容变化时主动播报 -->
+        <div class="form-error hidden" id="formError" role="alert"></div>
+
+        <button class="btn btn-primary btn-block submit-btn" id="submitBtn" type="submit">
+          <span class="btn-text">登 录</span>
+          <span class="spinner hidden" aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <div class="panel-foot">
+        <p class="muted tiny">
+          登录即表示您已阅读并同意<a href="#" id="policyLink">《内部系统使用规范》</a>
+        </p>
+        <p class="muted tiny mono" id="envLine"></p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/login.js"></script>
+</body>
+</html>

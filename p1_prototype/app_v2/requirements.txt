@@ -1,0 +1,23 @@
+# P2 工程版依赖（Python 3.9+ 兼容）
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart
+pydantic>=2.5
+pydantic-settings>=2.0
+python-dotenv
+openai>=1.10
+# 1.12.x 与 compose 中 qdrant/qdrant:v1.12.4 服务端严格对齐，
+# 避免客户端新版与服务端主版本不一致导致 REST/gRPC 行为漂移。
+qdrant-client>=1.12,<1.13
+psycopg2-binary>=2.9
+pypdf
+python-docx
+numpy
+jieba
+redis>=5.0,<7
+# P4：对象存储客户端。7.x 起 API 稳定，deleteobjects 子模块可用
+minio>=7.2,<8.0
+# P4：异步任务队列。broker/backend 都走 Redis，不引入 RabbitMQ
+celery>=5.3,<6.0
+# P4：结构化日志投递到 Logstash（TCP + JSON lines）
+python-json-logger>=2.0

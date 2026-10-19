@@ -1,0 +1,143 @@
+# K8s 部署清单：命名空间、配置、密钥、存储说明
+#
+# 设计原则：**有状态组件不自建**。
+#   PostgreSQL / Redis / 对象存储 / 向量库 在 K8s 里都优先接托管服务
+#   （RDS / ElastiCache / S3 / 云向量库）。理由不是"省事"，而是：
+#   自建 StatefulSet 意味着要把备份、主从、故障切换、版本升级全部自己做，
+#   这套工作量和风险远大于业务本身。清单里通过 ExternalName Service
+#   把托管地址接进集群，业务配置与托管/自建完全解耦。
+#
+# 如果确实要自建（内网隔离环境），把 external-services.yaml 换成对应的
+# StatefulSet + PVC 即可，其余清单不用改——这正是"用 Service 解耦"的价值。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rag-kb
+  labels:
+    app.kubernetes.io/part-of: rag-kb
+---
+# ---------------- 配置 ----------------
+# 非敏感配置放 ConfigMap；密钥放 Secret（见 secret.example.yaml）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-kb-config
+  namespace: rag-kb
+data:
+  ENV: "prod"
+  LOG_LEVEL: "INFO"
+  # 结构化 JSON 日志：文件采集型方案（ELK/ Loki）直接按字段建索引
+  LOG_FORMAT: "json"
+
+  # ---- 存储后端：全部指向托管服务 ----
+  VECTOR_BACKEND: "qdrant"
+  QDRANT_URL: "http://qdrant.rag-kb.svc.cluster.local:6333"
+  COLLECTION_NAME: "kb_chunks"
+  EMBED_DIM: "1024"
+  META_BACKEND: "postgres"
+
+  # ---- 多租户 ----
+  # TENANT_ENABLED 关闭等于所有企业共用一份数据，**生产绝不能关**
+  TENANT_ENABLED: "true"
+  DEFAULT_TENANT_ID: "default"
+  ROOT_TENANT_ADMIN: "root"
+
+  # ---- 安全 ----
+  AUTH_ENABLED: "true"
+  AUTH_MODE: "jwt"
+  JWT_ENABLED: "true"
+  JWT_ACCESS_TTL: "1800"
+  JWT_REFRESH_TTL: "604800"
+  JWT_BLACKLIST_ENABLED: "true"
+  METRICS_PROTECTED: "true"
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_DEFAULT: "120"
+
+  # ---- 对象存储 ----
+  MINIO_ENABLED: "true"
+  # 预签名 URL 里的 host。**K8s 下必须配成集群外可达的地址**
+  #（Ingress 域名或对象存储公网域名），否则浏览器打不开下载链接：
+  # 预签名 URL 由服务端生成、由浏览器访问，两者解析不了同一个内网域名。
+  MINIO_PUBLIC_ENDPOINT: "https://files.example.com"
+  MINIO_BUCKET: "rag-documents"
+  MINIO_SECURE: "true"
+  MINIO_PRESIGN_EXPIRE: "3600"
+  MINIO_TIMEOUT: "5"
+  MINIO_RETRIES: "1"
+  MINIO_FAILURE_COOLDOWN: "30"
+
+  # ---- 异步任务 ----
+  CELERY_ENABLED: "true"
+  CELERY_EAGER: "false"
+  # 软超时触发后任务被标记失败但进程不退出（区别于硬超时 SIGKILL）。
+  # 给 GB 级文档留足时间：1GB 文本在 2C4G 的 worker 上约 10~20 分钟。
+  CELERY_TASK_TIME_SOFT_LIMIT: "3600"
+
+  # ---- 大文档 ----
+  # 同步上限保持小：同步路径要把全文读进内存并在一个请求内跑完
+  MAX_UPLOAD_MB: "20"
+  # 异步上限放到 GB 级：走流式解析，内存与文件大小无关
+  MAX_ASYNC_UPLOAD_MB: "4096"
+  STREAM_INGEST_THRESHOLD_MB: "8"
+
+  # ---- 告警 ----
+  ALERT_ENABLED: "true"
+  # 关键：api 有多个副本时，每个副本都跑一遍评估会把同一次故障报 N 次。
+  # 因此 api 侧关闭进程内评估，由下面的 alert Deployment 以**单副本**承担。
+  ALERT_EVAL_IN_PROCESS: "false"
+  ALERT_EVAL_INTERVAL_SEC: "60"
+  ALERT_SILENCE_SEC: "300"
+
+  # ---- 检索参数 ----
+  CHUNK_SIZE: "450"
+  CHUNK_OVERLAP: "80"
+  RECALL_K: "10"
+  FINAL_TOP_K: "3"
+  MIN_SCORE: "0.25"
+  # 集群内流量不走代理，避免 Prometheus/Qdrant 请求被送到外部代理
+  NO_PROXY: "qdrant,postgres,redis,minio,localhost,127.0.0.1,.svc.cluster.local"
+---
+# ---------------- 外部依赖接入 ----------------
+# 用固定名字的 Service 指向外部地址，业务侧配置只认这个名字，
+# 后续把托管服务换成自建 StatefulSet 时业务配置零改动。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: rag-kb
+spec:
+  type: ExternalName
+  externalName: rag-pg.xxxxx.rds.amazonaws.com   # ← 改成实际的托管实例地址
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: rag-kb
+spec:
+  type: ExternalName
+  externalName: rag-redis.xxxxx.cache.amazonaws.com
+---
+# 注意：ExternalName 只做 DNS 别名，**不代理非标准端口**。
+# 若托管 Redis 不在 6379、或 PG 不在 5432，需要改用无 selector 的
+# Service + EndpointSlice 手工指定 ip:port。
+# MinIO 若用云对象存储（S3/OSS/COS），把 MINIO_ENDPOINT 直接写成云厂商域名即可，
+# 本清单不需要 minio Service。
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: rag-kb
+spec:
+  type: ExternalName
+  externalName: minio.rag-kb.svc.cluster.local   # 自建时指向内部服务；用云存储时删掉本段
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: rag-kb
+spec:
+  type: ExternalName
+  externalName: qdrant.rag-kb.svc.cluster.local

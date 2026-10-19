@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理后台 · 企业知识库</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/admin.css">
+</head>
+<body class="app-body">
+
+<header class="topbar">
+  <div class="topbar-left">
+    <a class="logo" href="/app">
+      <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
+        <rect width="40" height="40" rx="11" fill="url(#lg3)"/>
+        <path d="M12 11h11l5 5v13a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2V13a2 2 0 0 1 2-2z"
+              fill="none" stroke="#fff" stroke-width="2.4" stroke-linejoin="round"/>
+        <path d="M22.5 11v5.5H28" fill="none" stroke="#fff" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+        <defs><linearGradient id="lg3" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#e86395"/><stop offset="1" stop-color="#ad3a66"/>
+        </linearGradient></defs>
+      </svg>
+      <span class="logo-text">管理后台</span>
+    </a>
+    <span class="tenant-chip" id="tenantChip"></span>
+  </div>
+  <div class="topbar-right">
+    <div class="status-dot" id="healthDot"><span class="dot"></span><span class="status-text">检测中</span></div>
+    <nav class="topnav" aria-label="主导航">
+      <a class="topnav-link" href="/app">问答</a>
+      <a class="topnav-link active" href="/admin">管理后台</a>
+    </nav>
+    <div class="user-menu" id="userMenu">
+      <button class="avatar-btn" id="avatarBtn" type="button" aria-haspopup="true" aria-expanded="false">
+        <span class="avatar" id="avatarText">U</span>
+        <span class="user-name" id="userName"></span>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="dropdown hidden" id="userDropdown">
+        <div class="dropdown-head">
+          <div class="dd-name" id="ddName"></div>
+          <div class="dd-meta" id="ddMeta"></div>
+        </div>
+        <div class="dropdown-sep"></div>
+        <button class="dropdown-item danger" id="btnLogout" type="button">退出登录</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="admin-layout">
+
+  <!-- ---------- 侧栏导航 ---------- -->
+  <aside class="admin-nav" id="adminNav">
+    <div class="nav-group">
+      <div class="nav-label">知识库</div>
+      <button class="nav-item active" data-view="docs" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
+        <span>文档管理</span>
+      </button>
+      <button class="nav-item" data-view="spaces" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <span>知识库空间</span>
+      </button>
+      <button class="nav-item" data-view="tasks" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        <span>任务队列</span>
+        <span class="nav-badge hidden" id="taskBadge"></span>
+      </button>
+    </div>
+
+    <div class="nav-group" id="groupOps">
+      <div class="nav-label">运维监控</div>
+      <button class="nav-item" data-view="alerts" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+          <path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        <span>告警</span>
+        <span class="nav-badge err hidden" id="alertBadge"></span>
+      </button>
+      <button class="nav-item" data-view="audit" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        <span>审计日志</span>
+      </button>
+      <button class="nav-item" data-view="metrics" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg>
+        <span>运行指标</span>
+      </button>
+    </div>
+
+    <div class="nav-group" id="groupAdmin">
+      <div class="nav-label">系统管理</div>
+      <button class="nav-item" data-view="users" type="button">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>用户与密钥</span>
+      </button>
+    </div>
+
+    <div class="nav-foot">
+      <a href="/docs" target="_blank" rel="noopener">接口文档</a>
+      <a href="/dashboard" target="_blank" rel="noopener">内置看板</a>
+    </div>
+  </aside>
+
+  <!-- ---------- 内容区 ---------- -->
+  <main class="admin-main">
+
+    <!-- ============ 文档管理 ============ -->
+    <section class="view" id="view-docs">
+      <div class="view-head">
+        <div>
+          <h2>文档管理</h2>
+          <p class="muted">上传后自动解析、切片并向量化。同名文件重复上传视为覆盖更新。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnRefreshDocs" type="button">刷新</button>
+          <button class="btn btn-primary btn-sm" id="btnUpload" type="button">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+                 stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <path d="M17 8l-5-5-5 5M12 3v12"/></svg>
+            上传文档
+          </button>
+        </div>
+      </div>
+
+      <div class="toolbar card">
+        <div class="row grow">
+          <input class="input input-sm" id="docSearch" type="search" placeholder="按文件名搜索…"
+                 style="max-width:260px" aria-label="搜索文档">
+          <select class="select select-sm" id="docSpaceFilter" style="max-width:180px"
+                  aria-label="按空间筛选">
+            <option value="">全部空间</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="muted" style="font-size:12.5px" id="docCount"></span>
+        </div>
+      </div>
+
+      <div class="card table-card">
+        <div class="table-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>文件名</th>
+                <th style="width:110px">空间</th>
+                <th style="width:80px">密级</th>
+                <th style="width:90px">片段数</th>
+                <th style="width:100px">大小</th>
+                <th style="width:110px">上传人</th>
+                <th style="width:140px">更新时间</th>
+                <th style="width:120px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="docTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 知识库空间 ============ -->
+    <section class="view hidden" id="view-spaces">
+      <div class="view-head">
+        <div>
+          <h2>知识库空间</h2>
+          <p class="muted">空间是内容的属性，决定一份文档属于哪个业务域。检索时按空间隔离。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnRefreshSpaces" type="button">刷新</button>
+          <button class="btn btn-primary btn-sm" id="btnNewSpace" type="button">新建空间</button>
+        </div>
+      </div>
+      <div class="space-grid" id="spaceGrid"></div>
+    </section>
+
+    <!-- ============ 任务队列 ============ -->
+    <section class="view hidden" id="view-tasks">
+      <div class="view-head">
+        <div>
+          <h2>任务队列</h2>
+          <p class="muted">文档入库、重建索引、告警投递均为异步任务。大文件上传后在此查看进度。</p>
+        </div>
+        <div class="row">
+          <select class="select select-sm" id="taskStatusFilter" style="width:130px" aria-label="筛选状态">
+            <option value="">全部状态</option>
+            <option value="pending">排队中</option>
+            <option value="running">执行中</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" id="btnRefreshTasks" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="stat-row" id="taskStats"></div>
+      <div class="card table-card">
+        <div class="table-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width:150px">任务 ID</th>
+                <th style="width:90px">类型</th>
+                <th style="width:100px">状态</th>
+                <th>目标 / 错误</th>
+                <th style="width:90px">耗时</th>
+                <th style="width:140px">创建时间</th>
+                <th style="width:80px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="taskTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 告警 ============ -->
+    <section class="view hidden" id="view-alerts">
+      <div class="view-head">
+        <div>
+          <h2>告警</h2>
+          <p class="muted">规则评估周期 60 秒。同一规则在静默窗口内只通知一次，不会刷屏。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnDryRun" type="button">试算（不投递）</button>
+          <button class="btn btn-primary btn-sm" id="btnRefreshAlerts" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="stat-row" id="alertStats"></div>
+      <div class="panel-grid">
+        <div class="card panel">
+          <div class="panel-head">
+            <h3>告警事件</h3>
+            <select class="select select-sm" id="alertSevFilter" style="width:120px" aria-label="按级别筛选">
+              <option value="">全部级别</option>
+              <option value="critical">严重</option>
+              <option value="warning">警告</option>
+              <option value="info">提示</option>
+            </select>
+          </div>
+          <div class="alert-list" id="alertList"></div>
+        </div>
+        <div class="card panel">
+          <div class="panel-head"><h3>规则状态</h3></div>
+          <div class="rule-list" id="ruleList"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 审计日志 ============ -->
+    <section class="view hidden" id="view-audit">
+      <div class="view-head">
+        <div>
+          <h2>审计日志</h2>
+          <p class="muted">只追加、不可修改。记录包含被拒绝的越权尝试。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnRefreshAudit" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="toolbar card">
+        <div class="row grow">
+          <input class="input input-sm" id="auditActor" type="search" placeholder="按操作人过滤…"
+                 style="max-width:180px" aria-label="操作人">
+          <input class="input input-sm" id="auditAction" type="search" placeholder="按动作过滤，如 doc.upload"
+                 style="max-width:220px" aria-label="动作">
+          <select class="select select-sm" id="auditResult" style="max-width:130px" aria-label="结果">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="denied">被拒绝</option>
+            <option value="failed">失败</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" id="btnAuditSearch" type="button">查询</button>
+        </div>
+      </div>
+      <div class="card table-card">
+        <div class="table-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width:140px">时间</th>
+                <th style="width:110px">操作人</th>
+                <th style="width:80px">角色</th>
+                <th style="width:150px">动作</th>
+                <th>资源</th>
+                <th style="width:80px">结果</th>
+                <th style="width:70px">耗时</th>
+                <th style="width:150px">trace_id</th>
+              </tr>
+            </thead>
+            <tbody id="auditTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 运行指标 ============ -->
+    <section class="view hidden" id="view-metrics">
+      <div class="view-head">
+        <div>
+          <h2>运行指标</h2>
+          <p class="muted">进程内实时快照。历史趋势请查看 Grafana 或 Kibana。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnRefreshMetrics" type="button">刷新</button>
+        </div>
+      </div>
+      <div class="metric-grid" id="metricGrid"></div>
+      <div class="card panel" style="margin-top:var(--sp-4)">
+        <div class="panel-head"><h3>存储与依赖健康</h3></div>
+        <div class="health-grid" id="healthGrid"></div>
+      </div>
+    </section>
+
+    <!-- ============ 用户与密钥 ============ -->
+    <section class="view hidden" id="view-users">
+      <div class="view-head">
+        <div>
+          <h2>用户与密钥</h2>
+          <p class="muted">账号供人登录，密钥供系统间调用。密码与密钥明文只在创建时返回一次。</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-sm" id="btnRefreshUsers" type="button">刷新</button>
+          <button class="btn btn-primary btn-sm" id="btnNewUser" type="button">新建用户</button>
+        </div>
+      </div>
+      <div class="panel-grid even">
+        <div class="card panel">
+          <div class="panel-head"><h3>用户</h3></div>
+          <div class="table-scroll">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>用户名</th><th style="width:100px">角色</th>
+                  <th style="width:90px">状态</th><th style="width:140px">最近登录</th>
+                </tr>
+              </thead>
+              <tbody id="userTbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card panel">
+          <div class="panel-head">
+            <h3>API 密钥</h3>
+            <button class="btn btn-ghost btn-sm" id="btnNewKey" type="button">新建密钥</button>
+          </div>
+          <div class="table-scroll">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>key_id</th><th style="width:100px">归属</th>
+                  <th style="width:90px">状态</th><th style="width:70px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="keyTbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ---------- 上传文档弹窗 ---------- -->
+<div class="modal-mask hidden" id="uploadMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upTitle">
+    <div class="modal-head" id="upTitle">上传文档</div>
+    <div class="modal-body">
+      <div class="dropzone" id="dropzone" tabindex="0" role="button"
+           aria-label="点击或拖拽文件到此处上传">
+        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <path d="M17 8l-5-5-5 5M12 3v12"/></svg>
+        <div class="dz-title">点击选择，或拖拽文件到此处</div>
+        <div class="dz-hint" id="dzHint">支持 PDF / DOCX / TXT / MD，异步模式单文件最大 4GB</div>
+        <input type="file" id="fileInput" multiple hidden
+               accept=".pdf,.docx,.txt,.md,.markdown">
+      </div>
+      <div class="file-list" id="fileList"></div>
+
+      <div class="row" style="gap:var(--sp-3);margin-top:var(--sp-3)">
+        <div style="flex:1">
+          <label for="upSpace" class="lbl">目标空间</label>
+          <select class="select select-sm" id="upSpace"></select>
+        </div>
+        <div style="flex:0 0 130px">
+          <label for="upPerm" class="lbl">密级</label>
+          <input class="input input-sm" id="upPerm" value="all" maxlength="64">
+        </div>
+      </div>
+      <label class="checkbox" style="margin-top:var(--sp-3)">
+        <input type="checkbox" id="upAsync" checked>
+        <span>异步入库（大文件推荐：立即返回任务 ID，可继续操作）</span>
+      </label>
+      <p class="muted" id="upLimitHint" style="margin:var(--sp-2) 0 0;font-size:12px">
+        当前走异步通道，单文件上限 4.00 GB，内存占用与文件大小无关
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="upCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="upSubmit" type="button" disabled>开始上传</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------- 新建空间弹窗 ---------- -->
+<div class="modal-mask hidden" id="spaceMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="spTitle">
+    <div class="modal-head" id="spTitle">新建知识库空间</div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="spId">空间标识</label>
+        <input class="input" id="spId" maxlength="64" placeholder="例如 hr、finance（2~64 位字母数字下划线短横线）">
+        <div class="hint">创建后不可修改，会作为向量库过滤条件的一部分。</div>
+      </div>
+      <div class="field">
+        <label for="spName">空间名称</label>
+        <input class="input" id="spName" maxlength="128" placeholder="例如 人力资源">
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label for="spDesc">说明（可选）</label>
+        <textarea class="textarea" id="spDesc" maxlength="512" rows="2"
+                  placeholder="这个空间收录哪些资料"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="spCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="spSubmit" type="button">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------- 新建用户弹窗 ---------- -->
+<div class="modal-mask hidden" id="userMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="usTitle">
+    <div class="modal-head" id="usTitle">新建用户</div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="usName">用户名</label>
+        <input class="input" id="usName" maxlength="128" placeholder="登录账号">
+      </div>
+      <div class="field">
+        <label for="usPwd">初始密码</label>
+        <input class="input" id="usPwd" type="text" maxlength="128"
+               placeholder="至少 8 位，含字母与数字">
+        <div class="hint">请通过安全渠道转告用户，并提醒其首次登录后修改。</div>
+      </div>
+      <div class="field">
+        <label for="usRole">角色</label>
+        <select class="select" id="usRole">
+          <option value="user">普通用户 — 仅检索与问答</option>
+          <option value="kb_admin">知识库管理员 — 管理文档与空间</option>
+          <option value="admin">管理员 — 全部权限</option>
+        </select>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label for="usSpaces">可访问空间</label>
+        <input class="input" id="usSpaces" value="*" placeholder="* 表示全部，或用逗号分隔多个空间标识">
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="usCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="usSubmit" type="button">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------- 密钥明文展示 ---------- -->
+<div class="modal-mask hidden" id="secretMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="secTitle">
+    <div class="modal-head" id="secTitle">请立即保存密钥</div>
+    <div class="modal-body">
+      <div class="warn-box">
+        密钥明文<strong>只显示这一次</strong>，关闭后无法再次查看。请立即复制并妥善保存。
+      </div>
+      <div class="secret-box">
+        <code id="secretValue"></code>
+        <button class="btn btn-ghost btn-sm" id="secretCopy" type="button">复制</button>
+      </div>
+      <p class="muted" style="font-size:12.5px;margin-top:var(--sp-3)" id="secretNote"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="secretClose" type="button">我已保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# Prometheus 抓取 /metrics 的 Bearer 令牌
+#
+# 这个文件是**示例**。真实文件 metrics_token（同目录，无 .example 后缀）
+# 由服务首次启动时自动生成到 data_v2/metrics_token，
+# 部署时把它拷到这里，或直接挂载 Secret。
+#
+# 为什么不把真实令牌放进仓库：它是一个长期有效的凭据，
+# 一旦随代码公开，任何人都能拉到你的全部运行指标。
+#
+# 本地部署示例：
+#   cp ../data_v2/metrics_token ./metrics_token
+# K8s 部署：由 Secret 挂载，见 k8s/secret.example.yaml

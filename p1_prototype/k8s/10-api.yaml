@@ -1,0 +1,253 @@
+# API Deployment：无状态、可水平扩容
+#
+# 这个清单能成立的前提是 P4 已经做到的三件事（否则多副本会出各种"看起来像 bug"的现象）：
+#   1. 会话状态外置到 Redis（OIDC state / 一次性票据 / JWT 黑名单）——
+#      否则 A 副本登录、B 副本认不出，用户表现为"登录后随机被踢出"
+#   2. JWT_SECRET 在所有副本间一致（放在 Secret 里，不是每个 Pod 自动生成）——
+#      否则 A 签发的 token 在 B 上验签失败
+#   3. 告警评估只跑一份（见 40-alert.yaml）——
+#      否则同一次故障会被报 N 次，运维很快就学会无视告警
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-kb-api
+  namespace: rag-kb
+  labels:
+    app: rag-kb-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: rag-kb-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 滚动发布时先起新的再停旧的，且至少留 1 个可用副本。
+      # 这不是"稳妥一点"的偏好问题：本项目问答单次最长 120 秒，
+      # maxUnavailable>0 会让正在生成中的回答被直接打断。
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: rag-kb-api
+      annotations:
+        # 让 Prometheus 按注解自动发现抓取目标（配合 servicemonitor 或文件发现）
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8012"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 必须 ≥ uvicorn 的 --timeout-graceful-shutdown(130)。
+      # K8s 默认 30 秒就 SIGKILL，比 Docker 的 10 秒宽松一点但仍然不够：
+      # 一个正在生成 120 秒回答的请求会被腰斩，用户看到 502，
+      # 而服务端日志里那条请求是"正常完成"的（它在被杀前已经写完 access log）——
+      # 这是最难排查的一类故障，因为日志和现象对不上。
+      terminationGracePeriodSeconds: 150
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      # 优先分散到不同节点：所有副本落在一台机器上时，
+      # "弹性扩容"只是把同一个故障点放大。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: rag-kb-api
+      containers:
+        - name: api
+          image: registry.example.com/rag-kb-api:1.4.0-p4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8012
+          envFrom:
+            - configMapRef:
+                name: rag-kb-config
+            - secretRef:
+                name: rag-kb-secret
+          env:
+            # 实例标识取 Pod 名：多副本排查时，日志里必须能区分
+            # "是哪个 Pod 处理了这次请求"。留空会让日志全变成同一个值。
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              # requests 决定调度与 HPA 的百分比基准，必须贴近真实占用。
+              # 给太小会让节点超卖，给太大则扩容永远触发不了。
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              # 内存 limit 刻意给到 3 倍 requests：GB 级文档在流式路径下
+              # 峰值内存与文件大小**无关**（实测 270MB 文件峰值 34MB），
+              # 但向量批次、并发请求、PDF 解析仍会叠加。
+              # 留出余量避免"明明已经流式了还被 OOMKill"——
+              # 那种情况运维第一反应是"加内存"，而真正该看的是并发数。
+              cpu: "2"
+              memory: "3Gi"
+          # ---- 探针：三个路径语义不同，不能混用 ----
+          startupProbe:
+            # 启动探针给足时间：进程启动要加载 jieba 词典、建向量库连接。
+            # 没有它的话，liveness 会在启动期就把 Pod 判死，
+            # 表现为 CrashLoopBackOff 而日志一切正常。
+            httpGet:
+              path: /api/v1/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24        # 最长等 120 秒
+          livenessProbe:
+            # 活体只看"进程还活着"，**不能查依赖**。
+            # 若用 /ready 当 liveness，PostgreSQL 抖动一下所有副本会被同时重启，
+            # 把一次可恢复的依赖故障放大成整个服务不可用。
+            #
+            # 用 /api/v1/health 而不是 /api/v1/stats：
+            # stats 不在免鉴权白名单里，探针请求没有 JWT 会一直 401，
+            # Pod 会被判定 liveness 失败并无限重启——
+            # 而日志里只能看到一串 401，看起来像"鉴权配置错了"，方向完全跑偏。
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            # 就绪查依赖：依赖不可用时把 Pod 摘出 Service，
+            # 请求转给其他健康副本，而不是让用户拿到 500。
+            httpGet:
+              path: /api/v1/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          lifecycle:
+            preStop:
+              # K8s 摘 Service 与发 SIGTERM 是**并行**的，不是等摘完再杀。
+              # 没有这个 sleep，滚动发布瞬间会有少量请求打到正在关闭的 Pod，
+              # 表现为发布期间偶发 502（比例很低，因此常被忽略成"网络抖动"）。
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          volumeMounts:
+            - name: app-logs
+              mountPath: /app/data_v2/logs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # 日志走 emptyDir 而非 PVC：日志由采集器（Filebeat/Fluent Bit）实时取走，
+        # 留一份持久化副本只会在节点故障时变成"没人清理的孤儿数据"。
+        - name: app-logs
+          emptyDir: {}
+        # /tmp 必须单独挂：GB 级原件在入库期间会落临时文件，
+        # 落到容器可写层会撑爆节点磁盘，而且 emptyDir 能随 Pod 删除自动回收。
+        # sizeLimit 防一个病态大文件把节点的 /tmp 写满，连累同节点其他 Pod。
+        - name: tmp
+          emptyDir:
+            sizeLimit: 20Gi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: rag-kb-api
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-kb-api
+  namespace: rag-kb
+spec:
+  type: ClusterIP
+  selector:
+    app: rag-kb-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# ---------------- 自愿中断预算 ----------------
+# PDB 管的是"自愿中断"：节点排空（集群升级、缩容节点、内核热修复）。
+# 没有它的时候，运维执行 `kubectl drain` 会**按顺序把所有 Pod 一次性驱逐**，
+# 而不是等新 Pod 起来再动下一个——因为调度器没有义务在乎你的可用性。
+# 表现是"集群升级期间整个知识库 502，升级完自动恢复"，且没有任何告警
+# （服务确实在跑，只是没有副本）。
+#
+# minAvailable=1 而不是 50%：这里要的是"任何时刻至少留一个能服务"，
+# 用百分比在副本数变化时会出现 2 副本 → 1 副本进位取整的意外结果。
+# 1 副本的代价是排空会变慢（必须等新 Pod Ready 才能继续），这是有意的取舍。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-kb-api
+  namespace: rag-kb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rag-kb-api
+---
+# ---------------- 弹性扩容 ----------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-kb-api
+  namespace: rag-kb
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-kb-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # CPU 是主信号：本项目瓶颈在 embedding 与 rerank 的推理，
+    # 两者都是 CPU 密集型，CPU 上升与排队长度高度相关。
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      # 扩容要快：问答是交互式负载，让用户等 5 分钟再扩容等于没扩容。
+      # 30 秒窗口 + 一次最多翻倍，既能快速响应又不会瞬间打满节点。
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # 缩容要慢：这是**刻意的保守**。
+      # 缩容窗口太短会导致"扩了又缩、缩了又扩"的抖动，
+      # 而每次缩容都可能打断正在生成的长回答（最长 120 秒）。
+      # 300 秒窗口意味着"持续 5 分钟低负载"才缩，足够覆盖一轮问答高峰的尾巴。
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

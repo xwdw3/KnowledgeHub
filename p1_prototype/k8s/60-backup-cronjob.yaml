@@ -1,0 +1,88 @@
+# 对象存储备份：CronJob
+#
+# 备份这件事最容易犯的错不是"没备份"，而是**备份了但没人验证过能不能恢复**。
+# 所以这个 CronJob 做两件事：备份 + 立即校验清单完整性，任一失败即非零退出，
+# 由 K8s 的 Job 失败状态触发告警。
+#
+# 为什么备份到 PVC 而不是直接备份到另一个对象存储：
+#   - 备份到同一个 MinIO 是**伪备份**：桶被误删、账号被删、集群故障时，
+#     备份和目标一起消失。这是最常见也最致命的备份设计错误。
+#   - 生产应该备份到**独立的故障域**（另一朵云、异地机房）。
+#     这里给出 PVC 形态是因为它不依赖具体云厂商；
+#     实际部署时把 volume 换成对象存储 CSI（s3fs / OSS CSI）或直接
+#     在脚本里 rclone 到异地桶即可，CronJob 结构不用改。
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rag-kb-backup
+  namespace: rag-kb
+spec:
+  # 每天凌晨 2 点。避开业务高峰：备份会读全量对象，占用对象存储带宽。
+  schedule: "0 2 * * *"
+  timeZone: "Asia/Shanghai"
+  concurrencyPolicy: Forbid      # 上一次没跑完就跳过，不叠加
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    spec:
+      # 备份失败必须重试：网络抖动、对象存储限流都可能造成偶发失败，
+      # 一次失败就放弃等于当天没有备份。
+      backoffLimit: 3
+      # 备份是长任务：10GB 原件在 100Mbps 带宽下要 15 分钟以上
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: registry.example.com/rag-kb-api:1.4.0-p4
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  # 备份目录带日期，保留历史版本。
+                  # 只留一份"最新备份"是另一个常见错误：
+                  # 数据被误删后，第一次备份就会把"删空的状态"覆盖过去。
+                  DEST="/backup/$(date +%Y%m%d)"
+                  mkdir -p "$DEST"
+                  echo "[backup] start -> $DEST"
+                  python -m scripts.backup_objects --dest "$DEST"
+                  echo "[backup] done"
+              envFrom:
+                - configMapRef:
+                    name: rag-kb-config
+                - secretRef:
+                    name: rag-kb-secret
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "512Mi"
+                limits:
+                  # 备份是流式复制，内存与数据量无关（1MB 一块），
+                  # 给 1Gi 已经很宽裕。真正需要关注的是 PVC 容量。
+                  cpu: "1"
+                  memory: "1Gi"
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: rag-kb-backup
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rag-kb-backup
+  namespace: rag-kb
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      # 按"原件总量 × 保留天数"估算。7 天保留为例：
+      # 原件 50GB / 天增量很小的情况下，300Gi 足够。
+      # 注意：这里必须定期检查使用率，PVC 满了备份会静默失败。
+      storage: 300Gi
+  storageClassName: nfs-client

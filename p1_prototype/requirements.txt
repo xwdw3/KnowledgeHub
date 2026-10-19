@@ -1,0 +1,11 @@
+# P1 原型依赖
+# 说明：只保留验证 RAG 核心链路所需的最小集合
+fastapi>=0.100
+uvicorn[standard]
+python-multipart
+python-dotenv
+openai>=1.0
+pypdf
+python-docx
+numpy
+jieba

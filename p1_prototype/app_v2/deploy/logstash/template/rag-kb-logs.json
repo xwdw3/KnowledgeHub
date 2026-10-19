@@ -1,0 +1,43 @@
+# Elasticsearch 索引模板：为 rag-kb-logs-* 明确字段类型。
+#
+# 为什么必须显式声明而不是靠动态映射：
+#   动态映射会把第一次出现的字符串建成 text + keyword 双子字段，
+#   而 trace_id / tenant_id 这类字段我们只想精确匹配与聚合，
+#   被建成 text 后做 term 查询会静默失败（分词后原值已不存在），
+#   这是"查不到但确实有数据"这类疑难问题的经典成因。
+
+{
+  "index_patterns": ["rag-kb-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "5s",
+      "index.lifecycle.name": "rag-kb-logs-policy"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp":  { "type": "date" },
+        "level":       { "type": "keyword" },
+        "logger":      { "type": "keyword" },
+        "service":     { "type": "keyword" },
+        "trace_id":    { "type": "keyword" },
+        "tenant_id":   { "type": "keyword" },
+        "user_id":     { "type": "keyword" },
+        "role":        { "type": "keyword" },
+        "method":      { "type": "keyword" },
+        "path":        { "type": "keyword" },
+        "status":      { "type": "integer" },
+        "latency_ms":  { "type": "float" },
+        "latency_bucket": { "type": "keyword" },
+        "client_ip":   { "type": "ip" },
+        "event":       { "type": "keyword" },
+        "exc_type":    { "type": "keyword" },
+        "exc_message": { "type": "text" },
+        "message":     { "type": "text" },
+        "stack":       { "type": "text", "index": false }
+      }
+    }
+  }
+}

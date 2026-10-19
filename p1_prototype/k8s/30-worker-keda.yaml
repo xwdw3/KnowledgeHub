@@ -1,0 +1,75 @@
+# 按队列积压扩容（KEDA）
+#
+# 为什么 worker 的扩容判据是"队列长度"而不是 CPU：
+#
+#   CPU 衡量的是"正在跑的任务有多忙"，扩容真正需要的是"还有多少任务没开始跑"。
+#   这两件事并不等价，最典型的失效场景是：
+#
+#     夜里 11 点，有人一次性导入 200 份文档。
+#     2 个 worker 跑满（CPU 100%，HPA 会扩），但扩容有上限；
+#     等扩到 maxReplicas 就停了，而队列里还剩 150 条。
+#     运维看到的是"CPU 已经打满、任务排到明天"——
+#     此时无论怎么调 CPU 阈值都没用，因为副本数已到顶。
+#
+#     更糟的是另一种：任务都是 GB 级文档，单个任务在解析阶段 CPU 很高，
+#     但在等对象存储下载、等 LLM embedding 返回时 CPU 接近 0。
+#     这些"等待期"里 CPU 利用率掉下来，HPA 会判定"不需要那么多副本"
+#     开始缩容——**正在执行的任务被中断**，然后靠 acks_late 重投，
+#     从头再解析一遍。表现为"大文档永远处理不完"。
+#
+# KEDA 直接读 Redis list 长度（Celery 的队列就是 Redis list），
+# 语义精确：queue_length / 单 worker 吞吐 = 需要的副本数。
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rag-kb-worker
+  namespace: rag-kb
+spec:
+  scaleTargetRef:
+    name: rag-kb-worker
+  minReplicaCount: 2
+  maxReplicaCount: 16
+  # 最后一次有任务后 10 分钟内不缩容。
+  # 缩容会中断正在执行的 GB 级任务（虽有 acks_late 可重投，
+  # 但重投意味着前面的解析全部白做），因此宁可多留一会儿。
+  cooldownPeriod: 600
+  pollingInterval: 15
+  triggers:
+    # ---- 普通文档队列 ----
+    - type: redis
+      name: rag-queue
+      metadata:
+        addressFromEnv: REDIS_ADDRESS
+        listName: "rag"
+        # 积压 20 条任务对应加 1 个 worker。
+        # 阈值来自实测：单 worker 处理一份 5MB 文档约 40 秒（每分钟约 1.5 条），
+        # 积压 20 条 ≈ 13 分钟等待，已经超出用户可接受范围。
+        listLength: "20"
+        enableTLS: "false"
+    # ---- 大文档队列 ----
+    # 单独一条 trigger：大文档任务（>8MB）耗时是小文档的几十倍，
+    # 积压 2 条就值得加一个 worker。
+    # 若和小文档共用阈值（20 条），大文档会长时间排队而扩容不动。
+    - type: redis
+      name: rag-large-queue
+      metadata:
+        addressFromEnv: REDIS_ADDRESS
+        listName: "rag_large"
+        listLength: "2"
+        enableTLS: "false"
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 200
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120

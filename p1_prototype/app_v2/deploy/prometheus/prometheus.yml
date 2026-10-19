@@ -1,0 +1,39 @@
+# P3 · Prometheus 抓取配置
+# 只抓两个目标：应用自身，以及（可选的）Prometheus 自己。
+# Qdrant / PostgreSQL / Redis 的负载不靠各自的 exporter，而是由应用侧主动探测后
+# 以 rag_db_* / rag_qdrant_* / rag_redis_* 指标暴露——原因是私有化交付里
+# 少装一个 exporter 就少一个故障点，而应用本来就要连这些组件，探测成本几乎为零。
+#
+# 认证：/metrics 在 JWT 强制模式下不复用 JWT（抓取器无法执行登录/刷新流程），
+# 而是用独立的抓取令牌。这里从文件读取，令牌由 compose 挂载进来，
+# 不写在配置里，避免 prometheus.yml 随代码仓库流出时连令牌一起泄露。
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: rag-kb-p3
+    env: prod
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: rag-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      # 令牌文件由 docker-compose 从宿主机 .env 的 METRICS_TOKEN 生成后挂载
+      credentials_file: /etc/prometheus/metrics_token
+    static_configs:
+      - targets: ["api:8012"]
+        labels:
+          service: rag-api
+          component: application
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          service: prometheus

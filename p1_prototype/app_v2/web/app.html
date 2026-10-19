@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能问答 · 企业知识库</title>
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body class="app-body">
+
+<!-- ==================== 顶栏 ==================== -->
+<header class="topbar">
+  <div class="topbar-left">
+    <button class="icon-btn sidebar-toggle" id="sidebarToggle" type="button"
+            aria-label="展开/收起侧栏" aria-expanded="true">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+    <a class="logo" href="/app">
+      <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
+        <rect width="40" height="40" rx="11" fill="url(#lg2)"/>
+        <path d="M12 11h11l5 5v13a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2V13a2 2 0 0 1 2-2z"
+              fill="none" stroke="#fff" stroke-width="2.4" stroke-linejoin="round"/>
+        <path d="M22.5 11v5.5H28" fill="none" stroke="#fff" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+        <defs><linearGradient id="lg2" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#e86395"/><stop offset="1" stop-color="#ad3a66"/>
+        </linearGradient></defs>
+      </svg>
+      <span class="logo-text">企业知识库</span>
+    </a>
+    <span class="tenant-chip" id="tenantChip" title="当前租户"></span>
+  </div>
+
+  <div class="topbar-right">
+    <div class="status-dot" id="healthDot" title="服务状态">
+      <span class="dot"></span><span class="status-text">检测中</span>
+    </div>
+    <nav class="topnav" aria-label="主导航">
+      <a class="topnav-link active" href="/app">问答</a>
+      <a class="topnav-link" href="/admin">管理后台</a>
+    </nav>
+    <div class="user-menu" id="userMenu">
+      <button class="avatar-btn" id="avatarBtn" type="button" aria-haspopup="true" aria-expanded="false">
+        <span class="avatar" id="avatarText">U</span>
+        <span class="user-name" id="userName"></span>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="dropdown hidden" id="userDropdown">
+        <div class="dropdown-head">
+          <div class="dd-name" id="ddName"></div>
+          <div class="dd-meta" id="ddMeta"></div>
+        </div>
+        <div class="dropdown-sep"></div>
+        <button class="dropdown-item" id="btnShortcuts" type="button">快捷键</button>
+        <button class="dropdown-item" id="btnApiDocs" type="button">接口文档</button>
+        <div class="dropdown-sep"></div>
+        <button class="dropdown-item danger" id="btnLogout" type="button">退出登录</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ==================== 主区 ==================== -->
+<div class="app-layout">
+
+  <!-- ---------- 侧栏 ---------- -->
+  <aside class="sidebar" id="sidebar">
+    <button class="btn btn-primary btn-block new-chat-btn" id="btnNewChat" type="button">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+           stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      新建对话
+    </button>
+
+    <div class="side-section">
+      <div class="side-label">检索范围</div>
+      <div class="space-select-wrap">
+        <select class="select select-sm" id="spaceSelect" aria-label="选择知识库空间">
+          <option value="">全部空间</option>
+        </select>
+      </div>
+      <div class="side-hint" id="spaceHint"></div>
+    </div>
+
+    <div class="side-section">
+      <div class="side-label">回答模式</div>
+      <div class="mode-switch" role="radiogroup" aria-label="回答模式">
+        <button class="mode-opt active" data-mode="rag" role="radio" aria-checked="true" type="button">
+          <span class="mode-title">快速问答</span>
+          <span class="mode-desc">单次检索 · 低延迟</span>
+        </button>
+        <button class="mode-opt" data-mode="agent" role="radio" aria-checked="false" type="button">
+          <span class="mode-title">智能体</span>
+          <span class="mode-desc">多步工具调用</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="side-section grow">
+      <div class="side-label row-between">
+        <span>最近对话</span>
+        <button class="icon-btn sm" id="btnClearSessions" type="button" title="清空本地会话列表">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+        </button>
+      </div>
+      <div class="session-list" id="sessionList"></div>
+    </div>
+
+    <div class="side-foot">
+      <div class="side-foot-line">
+        <span class="muted">知识库</span>
+        <strong id="statDocs">-</strong>
+      </div>
+      <div class="side-foot-line">
+        <span class="muted">片段数</span>
+        <strong id="statChunks">-</strong>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ---------- 对话区 ---------- -->
+  <main class="chat-main">
+    <div class="chat-scroll" id="chatScroll">
+      <div class="chat-inner" id="chatInner">
+
+        <!-- 欢迎屏 -->
+        <section class="welcome" id="welcome">
+          <div class="welcome-icon" aria-hidden="true">
+            <svg viewBox="0 0 64 64" width="64" height="64" fill="none">
+              <circle cx="32" cy="32" r="30" stroke="var(--brand-200)" stroke-width="2"/>
+              <circle cx="32" cy="32" r="21" stroke="var(--brand-100)" stroke-width="2"/>
+              <path d="M22 26h20M22 33h20M22 40h12" stroke="var(--brand-500)"
+                    stroke-width="2.6" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <h1 class="welcome-title">有什么可以帮您？</h1>
+          <p class="welcome-desc">
+            我已学习单位内的规章制度与业务文档。提问后会给出来自原文的回答，并标注出处供您核对。
+          </p>
+
+          <div class="suggest-grid" id="suggestGrid">
+            <button class="suggest-card" data-q="去上海出差住宿标准是多少？" type="button">
+              <span class="sg-tag">差旅</span>
+              <span class="sg-title">去上海出差住宿标准是多少？</span>
+            </button>
+            <button class="suggest-card" data-q="年假怎么计算，入职不满一年有年假吗？" type="button">
+              <span class="sg-tag">人事</span>
+              <span class="sg-title">年假怎么计算，入职不满一年有年假吗？</span>
+            </button>
+            <button class="suggest-card" data-q="报销流程需要哪些材料，多久能到账？" type="button">
+              <span class="sg-tag">财务</span>
+              <span class="sg-title">报销流程需要哪些材料，多久能到账？</span>
+            </button>
+            <button class="suggest-card" data-q="请介绍一下知识库中都包含哪些文档" type="button">
+              <span class="sg-tag">概览</span>
+              <span class="sg-title">知识库里都有哪些文档？</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- 消息流 -->
+        <div class="messages" id="messages"></div>
+
+      </div>
+    </div>
+
+    <!-- 输入区 -->
+    <div class="composer-wrap">
+      <div class="composer" id="composer">
+        <textarea class="composer-input" id="questionInput" rows="1"
+                  placeholder="请输入问题，Enter 发送，Shift+Enter 换行"
+                  maxlength="1000" aria-label="问题输入框"></textarea>
+        <div class="composer-bar">
+          <div class="composer-left">
+            <span class="scope-pill" id="scopePill">全部空间</span>
+            <span class="char-count" id="charCount"></span>
+          </div>
+          <div class="composer-right">
+            <button class="icon-btn" id="btnStop" type="button" title="停止生成" hidden>
+              <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+                <rect x="7" y="7" width="10" height="10" rx="2"/>
+              </svg>
+            </button>
+            <button class="btn btn-primary send-btn" id="btnSend" type="button" disabled>
+              <span>发送</span>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                   stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <p class="composer-tip">
+        回答由大模型基于知识库内容生成，可能存在偏差，请以引用原文为准。
+      </p>
+    </div>
+  </main>
+</div>
+
+<!-- ==================== 快捷键面板 ==================== -->
+<div class="modal-mask hidden" id="shortcutMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="scTitle">
+    <div class="modal-head" id="scTitle">键盘快捷键</div>
+    <div class="modal-body">
+      <table class="table">
+        <tbody>
+          <tr><td>发送消息</td><td class="mono">Enter</td></tr>
+          <tr><td>换行</td><td class="mono">Shift + Enter</td></tr>
+          <tr><td>新建对话</td><td class="mono">Ctrl / ⌘ + K</td></tr>
+          <tr><td>聚焦输入框</td><td class="mono">/</td></tr>
+          <tr><td>收起侧栏</td><td class="mono">Ctrl / ⌘ + B</td></tr>
+          <tr><td>关闭弹层</td><td class="mono">Esc</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="scClose" type="button">知道了</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/markdown.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

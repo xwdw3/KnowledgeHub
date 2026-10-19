@@ -1,0 +1,61 @@
+# Ingress：对外唯一入口
+#
+# 关键点只有一条：**上传体积上限必须在网关层放开**。
+# 三层都有各自的默认上限，任何一层没放开，GB 级上传都会在这个关口失败：
+#
+#   1. Ingress Controller（nginx-ingress）→ proxy-body-size，默认 1MB
+#   2. 上游 Nginx（若存在）→ client_max_body_size，默认 1MB
+#   3. 应用层 → MAX_ASYNC_UPLOAD_MB（本项目 4096MB）
+#
+# 失败表现很有迷惑性：413 Request Entity Too Large，但**应用日志里什么都没有**——
+# 因为请求根本没到应用。运维第一反应是"后端限流把大文件拦了"，
+# 去改 MAX_ASYNC_UPLOAD_MB，改了也没用，方向完全错。
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-kb
+  namespace: rag-kb
+  annotations:
+    # 4GB + 余量。与 MAX_ASYNC_UPLOAD_MB 对齐（4096MB），
+    # 不要在这里写 0（不限制）：不限制意味着单个恶意请求可以把
+    # 内存/磁盘打满，等于把限流关掉。
+    nginx.ingress.kubernetes.io/proxy-body-size: "4200m"
+
+    # 问答单次最长 120 秒（LLM 生成），默认 60 秒会被网关先掐断。
+    # 现象是用户看到 504，而后端日志显示"请求正在正常处理"——
+    # 又是经典的"日志与现象对不上"。
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+
+    # 大文件上传的请求体不能整体缓冲到内存：nginx 默认会先落临时文件，
+    # 关掉之后边收边转发，避免网关侧也吃一份 GB 级临时文件。
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+
+    # 注意：**不要**配 affinity/ip_hash。
+    # 所有实例共享 Redis，任意副本都能处理任意请求；
+    # 一旦为了"省事"加上会话保持，就是在掩盖状态没外置干净的问题，
+    # 而且会让滚动发布期间部分用户被粘到正在关闭的 Pod 上。
+
+    # 限流放在网关比放在应用更早生效，但**不能替代应用层限流**：
+    # 网关只能按 IP 限，而本项目需要按租户限（同一企业多个 IP）。
+    # 这里只挡明显的异常流量。
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - rag.example.com
+      secretName: rag-kb-tls
+  rules:
+    - host: rag.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-kb-api
+                port:
+                  number: 80

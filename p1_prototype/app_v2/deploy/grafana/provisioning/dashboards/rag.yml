@@ -1,0 +1,16 @@
+# Grafana 面板自动装配：把 deploy/grafana/dashboards 下的 JSON 全部装载
+apiVersion: 1
+
+providers:
+  - name: rag-kb
+    orgId: 1
+    folder: "RAG 知识库"
+    folderUid: rag-kb
+    type: file
+    disableDeletion: false
+    # 允许在界面临时改面板；改了不会被容器重启覆盖（updateIntervalSeconds 只读取文件变更）
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

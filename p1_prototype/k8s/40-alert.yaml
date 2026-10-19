@@ -1,0 +1,98 @@
+# 告警评估器：**单副本**，不扩容
+#
+# 这是全项目唯一一个"故意不能扩容"的 Deployment，原因很实在：
+# 告警评估是"扫一遍当前状态，发现异常就发通知"的定时任务。
+# 若跑多个副本，同一次磁盘告警会被每个副本各发一遍——
+# 运维收到 5 条一模一样的短信，几次之后就会把这个告警通道设为免打扰，
+# 真正的事故通知也一起被忽略掉。
+#
+# 对比：api 侧已经用 ALERT_EVAL_IN_PROCESS=false 关掉了进程内评估，
+# 由这个 Deployment 单点承担。两处配合起来，"一次故障只报一次"才成立。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-kb-alert
+  namespace: rag-kb
+  labels:
+    app: rag-kb-alert
+    app.kubernetes.io/component: alert
+spec:
+  # 固定 1：这个值不能调大（见文件头说明）。
+  replicas: 1
+  # Recreate 而非 RollingUpdate：两个 Pod 同时存在的瞬间会各发一遍告警。
+  # 用 Recreate 保证"旧的完全停掉，新的才起来"，代价是发布期间有几十秒
+  # 没有告警评估——对分钟级的告警来说完全可以接受。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: rag-kb-alert
+  template:
+    metadata:
+      labels:
+        app: rag-kb-alert
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: alert
+          image: registry.example.com/rag-kb-api:1.4.0-p4
+          imagePullPolicy: IfNotPresent
+          # 复用同一个镜像，用 command 切换成"只跑告警评估循环"的入口。
+          # 不单独做一个镜像：告警规则与业务代码强耦合
+          #（要读文档数、任务失败数、检索延迟），版本必须与 api 严格一致，
+          # 两个镜像很容易出现"告警规则读的字段 api 已经改了"的错配。
+          #
+          # 注意入口路径是 app_v2.worker.alert_runner —— 它在 worker 包下，
+          # 不是 app_v2.alert_runner。写错路径的表现是 Pod 秒退 CrashLoop，
+          # 日志只有 "No module named ..."，看起来像镜像打包漏了文件。
+          command: ["python", "-m", "app_v2.worker.alert_runner"]
+          envFrom:
+            - configMapRef:
+                name: rag-kb-config
+            - secretRef:
+                name: rag-kb-secret
+          env:
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # 强制打开进程内评估：这个 Pod 的存在意义就是它
+            #（ConfigMap 里为 api 副本关掉了，这里必须显式覆盖回来）
+            - name: ALERT_EVAL_IN_PROCESS
+              value: "true"
+            # 评估器本身不提供 HTTP 服务（没有 uvicorn），因此
+            # 不能用 httpGet 探针。这里靠进程存活判定——
+            # K8s 会在进程退出时重启 Pod，而评估循环内部已经捕获了
+            # 所有单次评估异常，真正退出只可能是代码级故障。
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          # 刻意**不配 livenessProbe**。
+          #
+          # 评估器不提供 HTTP，可用的探针只有两种，都不合适：
+          #   1. exec 检查某个文件是否存在 —— 恒为真，等于没探。
+          #      它只能证明"容器没被删"，证明不了评估循环还在转。
+          #   2. 检查日志是否在更新 —— 这会让"日志采集故障"导致
+          #      "告警器被判死重启"。因果完全颠倒：最该响起告警的时候，
+          #      告警器自己先被重启了。
+          #
+          # 真正的存活保障由两件事提供，比探针可靠：
+          #   - alert_runner 内部对单轮评估做了 try/except，进程不会因
+          #     一次评估异常退出；只有代码级崩溃才会退出 → K8s 自动重启。
+          #   - "循环卡死但进程还活着"这种情况，用探针也发现不了
+          #     （HTTP exec 都会通过）。只能靠日志心跳 + 外部监控判断：
+          #     alert_runner 每 20 轮打一条 "第 N 轮评估完成"，
+          #     在 ELK / Loki 里对 alert-runner 建一条
+          #     "30 分钟内无日志" 的告警即可覆盖这个盲区。
+          #
+          # 也就是说：这个组件的健康判定**刻意交给了监控体系**，
+          # 而不是塞进 Pod 探针——因为它的失败模式是"静默不工作"，
+          # 而 Pod 探针只能发现"进程不在了"。

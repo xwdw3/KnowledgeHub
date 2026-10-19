@@ -1,0 +1,93 @@
+# P3 · 告警规则
+# 只保留"值班时真的会起床处理"的规则，不做指标全集告警，避免告警疲劳。
+groups:
+  - name: rag-availability
+    interval: 30s
+    rules:
+      - alert: RagApiDown
+        expr: up{job="rag-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RAG API 实例不可达"
+          description: "Prometheus 连续 1 分钟抓取 {{ $labels.instance }} 失败，服务可能已退出或端口不通。"
+
+      - alert: RagHighErrorRate
+        # 5 分钟内错误率超过 5%（错误数增量 / 请求数增量）
+        expr: |
+          (
+            sum(rate(rag_http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(rag_http_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "5xx 错误率过高（>5%）"
+          description: "当前 5xx 占比 {{ $value | humanizePercentage }}，请检查日志中的 trace_id 定位根因。"
+
+      - alert: RagLatencyP95High
+        expr: rag_request_duration_ms{quantile="p95"} > 3000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "接口 P95 延迟超过 3s"
+          description: "当前 P95 = {{ $value }}ms。常见原因：模型侧变慢、向量库负载高、缓存失效。"
+
+  - name: rag-resources
+    interval: 30s
+    rules:
+      - alert: RagDbPoolSaturated
+        # 连接池占用持续 80% 以上：再涨就会出现"获取连接超时"
+        expr: rag_db_pool_used / clamp_min(rag_db_pool_max, 1) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据库连接池接近耗尽"
+          description: "已用 {{ $value | humanizePercentage }}。请排查长事务或慢查询。"
+
+      - alert: RagVectorStoreSlow
+        expr: rag_qdrant_latency_ms{quantile="p95"} > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "向量库 P95 延迟超过 500ms"
+          description: "当前 P95 = {{ $value }}ms，检索链路将变慢。"
+
+      - alert: RagLlmFailureRate
+        expr: |
+          sum(rate(rag_llm_failures_total[5m]))
+          / clamp_min(sum(rate(rag_llm_calls_total[5m])), 0.001) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "大模型调用失败率超过 20%"
+          description: "当前失败率 {{ $value | humanizePercentage }}，可能触发降级回答，请检查模型网关与网络代理。"
+
+  - name: rag-security
+    interval: 30s
+    rules:
+      - alert: RagAuthBruteForce
+        # 1 分钟内认证失败超过 20 次：典型的撞库/爆破特征
+        expr: increase(rag_auth_failures_total[1m]) > 20
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "疑似认证爆破"
+          description: "1 分钟内认证失败 {{ $value }} 次，请检查审计日志中的来源 IP。"
+
+      - alert: RagRateLimitSpike
+        expr: increase(rag_rate_limited_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "限流拒绝量突增"
+          description: "5 分钟内被限流 {{ $value }} 次，可能是爬虫、脚本重试风暴或阈值配置过严。"

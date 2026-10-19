@@ -1,0 +1,207 @@
+# Worker Deployment：异步任务执行者
+#
+# **为什么 worker 和 api 分成两个 Deployment**（而不是同一个镜像跑两种命令）
+# 理由不是"架构好看"，而是两类负载的扩容判据完全相反：
+#   - api：交互式，用户等着响应，按 CPU/延迟扩容，缩容要谨慎（会打断长回答）
+#   - worker：批处理，用户不等待，按**队列积压**扩容，缩容很随意（任务可重投）
+# 混在一个 Deployment 里，就只能用同一套 HPA 规则，两边都不合适。
+#
+# 关键设计：worker 按大文件/小文件分成两条队列（见 QUEUE 说明），
+# 避免"一个 1GB 文档占住所有 worker，几十个小文件排在后面"。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-kb-worker
+  namespace: rag-kb
+  labels:
+    app: rag-kb-worker
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: rag-kb-worker
+  # worker 必须显式声明 RollingUpdate 且 **maxSurge=0**：
+  # 大文档任务动辄跑十几分钟，若和 api 一样"先起新的再停旧的"，
+  # 发布会同时多出一批 worker 抢同一队列，而旧的还要跑完才退——
+  # 短时间内副本数翻倍，把 Redis 连接数和节点内存一起顶上去。
+  # 这里选择"先停一个、再起一个"：短暂少一个消费者，任务留在队列里不丢
+  # （acks_late + 队列持久化），代价只是吞吐略降，比资源翻倍安全。
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: rag-kb-worker
+    spec:
+      # worker 处理 GB 级文档可能跑十几分钟。SIGTERM 后 Celery 会等当前任务
+      # 执行完再退出（默认 warm shutdown）。给 10 分钟：
+      # 超过这个时间的任务本来就该靠 acks_late + 可见性超时重投，
+      # 而不是让 K8s 无限期等它。
+      terminationGracePeriodSeconds: 600
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: worker
+          image: registry.example.com/rag-kb-api:1.4.0-p4
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - -A
+            - app_v2.worker.tasks.celery_app
+            - worker
+            - --loglevel=info
+            # 单 Pod 并发数。**不要设太大**：每个任务都可能解析 GB 级文档，
+            # 并发 8 在 4Gi 内存下会互相挤爆（流式路径虽然省内存，
+            # 但 PDF 解析、embedding 批次仍按任务独立占用）。
+            # 需要更高吞吐时优先加副本（HPA 会自动做），而不是调大这个数——
+            # 加副本还能顺带获得故障隔离。
+            - --concurrency=2
+            # 每个子进程处理若干任务后重启，防止第三方库的内存泄漏累积。
+            # GB 级文档场景下这个值要小一些：一次大文档处理就可能留下几十 MB 碎片。
+            - --max-tasks-per-child=20
+            - --queues=rag,rag_large
+            # 任务确认放在**执行之后**（acks_late）：worker 被 OOMKill 时
+            # 任务会重新入队而不是消失。默认的 acks_early 在
+            # "任务刚拿到就被杀"的场景下会永久丢任务——
+            # 现象是"上传成功但文档永远不入库"，且没有任何报错。
+            - --task-events
+            - --without-gossip
+            - --without-mingle
+          envFrom:
+            - configMapRef:
+                name: rag-kb-config
+            - secretRef:
+                name: rag-kb-secret
+          env:
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # 队列优先级：同一个 worker 先取 rag（普通文档），再取 rag_large。
+            # 大文件任务由上传接口按 size 决定投到哪条队列，
+            # 这样"一个人传 2GB 文档"不会把所有人的小文件一起堵住。
+            - name: CELERY_QUEUES
+              value: "rag,rag_large"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              # worker 的内存上限要比 api 宽松：虽然流式路径内存与文件大小无关，
+              # 但 --concurrency=2 意味着同时有两份解析上下文，
+              # 加上 embedding 批次，峰值是 api 单请求的数倍。
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            # worker 没有 HTTP 端口，用 celery inspect ping 探活。
+            # 注意它会开一个到 broker 的连接，因此 timeout 给宽一些——
+            # Redis 稍慢就判死会造成无谓重启。
+            exec:
+              command:
+                - sh
+                - -c
+                - "celery -A app_v2.worker.tasks.celery_app inspect ping -d celery@$HOSTNAME --timeout 15"
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 20
+            failureThreshold: 3
+          # startupProbe：worker 的冷启动包括 import 整个服务栈 + 建 Redis/PG 连接，
+          # 在镜像层未预热、节点 IO 抖动时会明显超过 30 秒。
+          # 没有它的话，liveness 的 initialDelaySeconds=30 一到就开始计时，
+          # 启动中被判死一次就等于丢掉这 30 秒的进度并重来；
+          # 连续几次失败则进入 CrashLoopBackOff，看起来像"镜像坏了"。
+          # 有 startupProbe 时 liveness 在启动成功前**完全不生效**，语义更干净。
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "celery -A app_v2.worker.tasks.celery_app inspect ping -d celery@$HOSTNAME --timeout 5"
+            periodSeconds: 10
+            failureThreshold: 30          # 最长容忍 5 分钟启动
+          volumeMounts:
+            - name: tmp
+              # GB 级原件在解析期间落在这里。**必须挂 emptyDir**：
+              # 落到容器可写层会随镜像层一起增长，节点磁盘被吃满后
+              # 影响的是同一节点上的所有 Pod（包括 api），
+              # 而告警只会说"磁盘使用率高"，很难定位到是 worker 的临时文件。
+              mountPath: /tmp
+            - name: app-logs
+              mountPath: /app/data_v2/logs
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 50Gi
+        - name: app-logs
+          emptyDir: {}
+---
+# ---------------- 按队列积压扩容 ----------------
+# 说明：K8s 没有内置"Redis 队列长度"指标，需要外部（KEDA 或 Prometheus Adapter）。
+# 这里给出两条路，二选一：
+#
+# 方案 A（推荐）：KEDA ScaledObject，直接读 Redis list 长度，零额外组件。
+# 见 30-worker-keda.yaml。
+#
+# 方案 B：不装 KEDA 时用 CPU 兜底（本文件里的 HPA）。
+#   缺点很明确：worker 在**解析阶段是 CPU 密集**的，但
+#   "任务在排队、worker 闲着"时 CPU 很低，HPA 不会扩容——
+#   恰恰是最需要扩容的时刻它不扩。所以这是降级方案，不是首选。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-kb-worker-cpu
+  namespace: rag-kb
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-kb-worker
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+    scaleDown:
+      # 缩容窗口给到 10 分钟：worker 上一个任务可能正在处理 GB 级文档，
+      # 频繁缩容会导致"任务被反复重投、永远跑不完"。
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+# ---------------- 自愿中断预算 ----------------
+# 集群升级时 worker 也会被逐个驱逐。minAvailable=1 保证排空期间
+# 队列**始终有消费者**——否则一份 GB 级文档会停在半路：
+# warm shutdown 有 600 秒上限，超时的任务只能靠 acks_late 重投，
+# 而重投意味着前面十几分钟的解析全部作废。
+# 与 api 同理，这里用绝对副本数而非百分比，避免进位取整的意外。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-kb-worker
+  namespace: rag-kb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rag-kb-worker

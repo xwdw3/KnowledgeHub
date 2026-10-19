@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+data/index/*.npz
+data/index/*.json
+*.log
+resp.json

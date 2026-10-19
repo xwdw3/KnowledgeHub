@@ -1,0 +1,605 @@
+# ================= P3 多知识库协同版 · 单机容器化部署 =================
+# 服务：qdrant（向量库）+ postgres（业务库）+ redis（缓存）+ api（FastAPI）
+#
+# 启动：docker compose -f app_v2/docker-compose.yml up -d --build
+# 文档：http://127.0.0.1:8012/docs    看板：/dashboard    指标：/metrics
+#
+# 说明：Qdrant / PostgreSQL / Redis 仅在内网 ragnet 中可达，不映射宿主机端口，
+#       生产环境只暴露 api:8012，避免数据组件被直接访问。
+#       Redis 设置 appendonly no + maxmemory 策略：缓存可丢，不做持久化，
+#       避免把缓存当数据库用（Redis 挂了会自动降级为 L1 本地缓存，服务不中断）。
+#
+# P3 变化：
+#   - 账号密码登录（JWT），与 API Key 双通道并存
+#   - 知识库空间（多租户隔离），元数据/向量/缓存三层同时下推
+#   - Redis 承担新职责：Token 黑名单、限流计数器、对话上下文缓存
+#     → 这三项都是「必须共享」的状态，多实例部署时不能放进程内
+#
+# P4 变化：
+#   - MinIO 对象存储（原件落点，支持预签名直传）
+#   - Celery worker（文档解析/向量化脱离请求线程）
+#   - ELK：Elasticsearch + Logstash + Kibana（日志检索与看板）
+#   - 多租户：所有数据以 tenant_id 为最外层隔离
+#
+# 资源约束（单机 8GB 内存的实际取舍）：
+#   ES 堆锁 512MB —— 日志量在演示规模下完全够用，给多了会把用户态文件缓存挤掉，
+#   反而让查询变慢。Kibana 只做展示，给 512MB 上限。
+#   若宿主机内存紧张，可用 `--profile` 选择性启动：docker compose up -d --scale 等
+#   或设置 ELK_ENABLED=false 只跑业务链路。
+
+name: rag-kb-p4
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: rag_p4_qdrant
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: rag_p4_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-raguser}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-ragpass123}
+      POSTGRES_DB: ${PG_DB:-rag_db}
+      TZ: Asia/Shanghai
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-raguser} -d ${PG_DB:-rag_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag_p4_redis
+    restart: unless-stopped
+    # 缓存语义：不落盘、容量上限 + LRU 淘汰，内存可控且不会拖慢主链路
+    command: >
+      redis-server
+      --appendonly no
+      --save ""
+      --maxmemory ${REDIS_MAXMEMORY:-256mb}
+      --maxmemory-policy allkeys-lru
+      --timeout 0
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - redis_data:/data
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  api:
+    build:
+      context: ..
+      dockerfile: app_v2/Dockerfile
+    # 不写死 container_name：写了就**无法 scale（docker compose up --scale api=3）**，
+    # 因为 Compose 不允许同名容器。这是多副本部署最容易被忽略的阻塞点——
+    # 报错是 "container name already in use"，看起来像端口冲突，实际是命名冲突。
+    # 代价是容器名变成 rag_p4_api-1 / -2 / -3，运维脚本不能依赖固定名。
+    restart: unless-stopped
+    ports:
+      # 多副本时不能固定映射宿主机端口（会抢端口），应由前置 Nginx 走内部网络。
+      # 单副本调试仍保留映射，多副本部署时把 API_PORT 留空即可。
+      - "${API_PORT:-8012}:8012"
+    environment:
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # P3：结构化 JSON 日志（Filebeat/Loki 直接按字段建索引）；
+      # 本地排查若想看人读格式，改成 text 即可，代码逻辑完全一致
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      # 存储：容器内一律走真实后端，不再降级
+      VECTOR_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      COLLECTION_NAME: ${COLLECTION_NAME:-kb_chunks}
+      EMBED_DIM: ${EMBED_DIM:-1024}
+      META_BACKEND: postgres
+      DATABASE_URL: postgresql://${PG_USER:-raguser}:${PG_PASSWORD:-ragpass123}@postgres:5432/${PG_DB:-rag_db}
+      # ---- P2 安全 ----
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      # jwt：只认 JWT（API Key 仅用于换取 token）
+      # any：P2 兼容模式，API Key 可直接当 Bearer 用
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      # /metrics 的抓取令牌（与 JWT 分离）。留空则自动生成并持久化到数据卷。
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      METRICS_PROTECTED: ${METRICS_PROTECTED:-true}
+      DASHBOARD_PUBLIC: ${DASHBOARD_PUBLIC:-true}
+      # 首次部署固定管理员密钥，避免每次重建都换（未设置则启动时随机生成并打印到日志）
+      BOOTSTRAP_ADMIN_KEY: ${BOOTSTRAP_ADMIN_KEY:-}
+      AUTH_CACHE_TTL: ${AUTH_CACHE_TTL:-60}
+      # ---- P3 账号 / JWT ----
+      JWT_ENABLED: ${JWT_ENABLED:-true}
+      # 留空则自动生成并持久化到数据卷（容器重建后 token 依然有效，避免全员重登）
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-1800}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
+      JWT_BLACKLIST_ENABLED: ${JWT_BLACKLIST_ENABLED:-true}
+      BOOTSTRAP_ADMIN_USER: ${BOOTSTRAP_ADMIN_USER:-admin}
+      # 建议在 .env 里固定，避免每次重建都换密码
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      # ---- P3 知识库空间 ----
+      DEFAULT_SPACE_ID: ${DEFAULT_SPACE_ID:-default}
+      DEFAULT_SPACE_NAME: ${DEFAULT_SPACE_NAME:-默认空间}
+      # ---- P3 限流 ----
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-120}
+      RATE_LIMIT_WINDOW_SEC: ${RATE_LIMIT_WINDOW_SEC:-60}
+      RATE_LIMIT_RULES: ${RATE_LIMIT_RULES:-/api/v1/chat=30,/api/v1/documents=20,/api/v1/auth/login=10,/metrics=600}
+      # ---- P3 Rerank ----
+      RERANK_MODE: ${RERANK_MODE:-llm}
+      RERANK_CANDIDATES: ${RERANK_CANDIDATES:-10}
+      RERANK_TIMEOUT_SEC: ${RERANK_TIMEOUT_SEC:-12}
+      CACHE_TTL_CONTEXT: ${CACHE_TTL_CONTEXT:-1800}
+      # ---- P2 缓存 ----
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_RETRIEVAL: ${CACHE_TTL_RETRIEVAL:-300}
+      CACHE_TTL_ANSWER: ${CACHE_TTL_ANSWER:-600}
+      CACHE_L1_SIZE: ${CACHE_L1_SIZE:-2048}
+      # ---- P2 审计与监控 ----
+      AUDIT_ENABLED: ${AUDIT_ENABLED:-true}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      # 模型（密钥从宿主机环境或 .env 注入，不写进镜像）
+      MODEL_MODE: ${MODEL_MODE:-auto}
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-m3}
+      EMBED_API_KEY: ${EMBED_API_KEY:-${API_KEY_SILICON:-}}
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-https://api.siliconflow.cn/v1}
+      CHAT_MODEL: ${CHAT_MODEL:-deepseek-flash}
+      CHAT_API_KEY: ${CHAT_API_KEY:-${DEEPSEEK_API_KEY:-}}
+      CHAT_BASE_URL: ${CHAT_BASE_URL:-https://api.deepseek.com}
+      # 检索与 Agent 参数
+      CHUNK_SIZE: ${CHUNK_SIZE:-450}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-80}
+      RECALL_K: ${RECALL_K:-10}
+      RRF_K: ${RRF_K:-60}
+      FINAL_TOP_K: ${FINAL_TOP_K:-3}
+      MIN_SCORE: ${MIN_SCORE:-0.25}
+      AGENT_MAX_ROUNDS: ${AGENT_MAX_ROUNDS:-3}
+      AGENT_MAX_REPEAT: ${AGENT_MAX_REPEAT:-2}
+      AGENT_TIMEOUT_SEC: ${AGENT_TIMEOUT_SEC:-60}
+      AGENT_MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-6}
+      # 外网模型 API 走宿主机代理（容器直连境外/被干扰链路会 SSL EOF）；
+      # NO_PROXY 保证 Qdrant/PostgreSQL/Redis 等内网流量不经过代理。
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: qdrant,postgres,redis,minio,elasticsearch,logstash,localhost,127.0.0.1
+      # ---- P4 多租户 ----
+      TENANT_ENABLED: ${TENANT_ENABLED:-true}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      DEFAULT_TENANT_NAME: ${DEFAULT_TENANT_NAME:-默认租户}
+      ROOT_TENANT_ADMIN: ${ROOT_TENANT_ADMIN:-root}
+      # ---- P4 对象存储 ----
+      MINIO_ENABLED: ${MINIO_ENABLED:-true}
+      # 内网地址：客户端连接用
+      MINIO_ENDPOINT: minio:9000
+      # 对外地址：预签名 URL 里出现的 host。留空则用内网地址
+      #（浏览器解析不了 minio:9000，所以跨机访问时**必须**配这一项，
+      #  例如 http://192.168.1.10:9000）
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-ragadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-ragminio2026}
+      MINIO_BUCKET: ${MINIO_BUCKET:-rag-documents}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_PRESIGN_EXPIRE: ${MINIO_PRESIGN_EXPIRE:-3600}
+      # ---- P4 异步任务 ----
+      CELERY_ENABLED: ${CELERY_ENABLED:-true}
+      # broker 与 result 必须分库：混用会在清理缓存时连带删掉待执行任务
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_URL: redis://redis:6379/1
+      CELERY_EAGER: ${CELERY_EAGER:-false}
+      CELERY_TASK_TIME_SOFT_LIMIT: ${CELERY_TASK_TIME_SOFT_LIMIT:-300}
+      # ---- P4 ELK ----
+      LOG_SHIP_ENABLED: ${LOG_SHIP_ENABLED:-true}
+      LOG_SHIP_PATH: /app/data_v2/logs/app.jsonl
+      LOG_SHIP_MAX_BYTES: ${LOG_SHIP_MAX_BYTES:-67108864}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      LOG_INDEX_PREFIX: ${LOG_INDEX_PREFIX:-rag-kb-logs}
+      # ---- P4 告警 ----
+      ALERT_ENABLED: ${ALERT_ENABLED:-true}
+      # 多实例部署时，api 副本会各自跑一份评估——同一次故障会被报 N 次。
+      # 因此 api 侧关闭应用内评估，由下方 alert 服务单点承担。
+      # 单实例部署想省一个容器，把这两个值对调即可（见部署文档）。
+      ALERT_EVAL_IN_PROCESS: ${ALERT_EVAL_IN_PROCESS:-false}
+      ALERT_EVAL_INTERVAL_SEC: ${ALERT_EVAL_INTERVAL_SEC:-60}
+      ALERT_SILENCE_SEC: ${ALERT_SILENCE_SEC:-300}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_TIMEOUT: ${ALERT_WEBHOOK_TIMEOUT:-5}
+      ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-}
+      ALERT_SMTP_PORT: ${ALERT_SMTP_PORT:-465}
+      ALERT_SMTP_USER: ${ALERT_SMTP_USER:-}
+      ALERT_SMTP_PASSWORD: ${ALERT_SMTP_PASSWORD:-}
+      ALERT_SMTP_FROM: ${ALERT_SMTP_FROM:-}
+      ALERT_MAIL_TO: ${ALERT_MAIL_TO:-}
+      # ---- P4 SSO ----
+      OIDC_ENABLED: ${OIDC_ENABLED:-false}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-rag-kb}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      # 身份字段映射：不同 IdP 的 claim 名差别很大（Keycloak 用 realm_access.roles，
+      # Azure AD 用 groups，Authing 用 company），因此全部可配，支持点号路径。
+      OIDC_USERNAME_CLAIM: ${OIDC_USERNAME_CLAIM:-preferred_username}
+      OIDC_EMAIL_CLAIM: ${OIDC_EMAIL_CLAIM:-email}
+      OIDC_NAME_CLAIM: ${OIDC_NAME_CLAIM:-name}
+      # 租户：从 IdP 的哪个字段取公司标识。**多租户部署必须配**，
+      # 否则所有 SSO 用户都会落到 OIDC_DEFAULT_TENANT 里，隔离形同虚设。
+      OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-}
+      # 角色：显式映射表，不做"取最高权限"推断（防意外提权）
+      OIDC_ROLE_CLAIM: ${OIDC_ROLE_CLAIM:-}
+      OIDC_ROLE_MAP: ${OIDC_ROLE_MAP:-}
+      OIDC_DEFAULT_ROLE: ${OIDC_DEFAULT_ROLE:-user}
+      OIDC_DEFAULT_TENANT: ${OIDC_DEFAULT_TENANT:-default}
+      OIDC_AUTO_PROVISION: ${OIDC_AUTO_PROVISION:-true}
+      # ---- P4 多实例 ----
+      # 用来区分"哪台机器/哪个接口的请求"。多副本时日志与指标都靠它定位，
+      # 留空则自动取容器 hostname。
+      INSTANCE_ID: ${INSTANCE_ID:-}
+      # 多副本下 Celery worker 与 api 必须同版本；镜像 tag 由发布流程统一注入
+      APP_VERSION_SUFFIX: ${APP_VERSION_SUFFIX:-}
+    volumes:
+      # 日志卷：与 Logstash 共享，是 ELK 采集的唯一通道
+      - app_logs:/app/data_v2/logs
+    # 必须 ≥ Dockerfile 里的 --timeout-graceful-shutdown(130)。
+    # Docker 默认只给 10 秒，到点直接 SIGKILL——uvicorn 那边的优雅停机
+    # 根本来不及生效，正在生成的回答被强杀，用户看到 502 而日志正常。
+    stop_grace_period: 150s
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [ragnet]
+
+  # ---------------- P3 监控栈 ----------------
+  # Prometheus 抓取 api:8012/metrics；Grafana 预置数据源与面板，开箱即看。
+  # 两者都只在内网 ragnet 中可达，仅 Grafana 映射到宿主机 3000（可在 .env 改）。
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: rag_p4_prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 保留 7 天：单机演示足够，且磁盘占用可控（~200MB 量级）
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # 抓取令牌：由 .env 的 METRICS_TOKEN 落成只读文件注入。
+      # 不直接写进 prometheus.yml，是为了让"配置"与"密钥"分离——
+      # 配置可以进仓库、进镜像，密钥不行。
+      - ./deploy/prometheus/metrics_token:/etc/prometheus/metrics_token:ro
+      - prometheus_data:/prometheus
+    environment:
+      - TZ=Asia/Shanghai
+    # 映射到宿主机：Prometheus 的 Web UI / 查询 API 是运维与验收要用的界面，
+    # 只留容器内网的话，验收脚本和人都只能 docker exec 进去查，很不方便。
+    ports:
+      - "9090:9090"
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: rag_p4_grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # 匿名只读：演示时无需登录即可看板；生产按需改为 false 并配 LDAP/OAuth
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-true}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-Admin@12345}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 关闭更新检查与遥测，私有化环境不应外联
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks: [ragnet]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------- P4 对象存储 ----------------
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: rag_p4_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-ragadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-ragminio2026}
+      TZ: Asia/Shanghai
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ---------------- P4 异步任务 worker ----------------
+  worker:
+    build:
+      context: ..
+      dockerfile: app_v2/Dockerfile
+    # 同样不写死容器名：任务量大时用 `--scale worker=4` 横向扩容，
+    # 固定名会让第二条命令直接失败。worker 是**天然可多副本**的组件
+    # （Celery 从 Redis 队列竞争取任务），无需额外改造。
+    restart: unless-stopped
+    command: >
+      celery -A app_v2.worker.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=${CELERY_CONCURRENCY:-2}
+      --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-50}
+      -Q rag,rag_large
+    environment:
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      VECTOR_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      COLLECTION_NAME: ${COLLECTION_NAME:-kb_chunks}
+      EMBED_DIM: ${EMBED_DIM:-1024}
+      META_BACKEND: postgres
+      DATABASE_URL: postgresql://${PG_USER:-raguser}:${PG_PASSWORD:-ragpass123}@postgres:5432/${PG_DB:-rag_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_ENABLED: "true"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_URL: redis://redis:6379/1
+      CELERY_EAGER: "false"
+      CELERY_TASK_TIME_SOFT_LIMIT: ${CELERY_TASK_TIME_SOFT_LIMIT:-300}
+      TENANT_ENABLED: ${TENANT_ENABLED:-true}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      DEFAULT_SPACE_ID: ${DEFAULT_SPACE_ID:-default}
+      MINIO_ENABLED: ${MINIO_ENABLED:-true}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-ragadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-ragminio2026}
+      MINIO_BUCKET: ${MINIO_BUCKET:-rag-documents}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      LOG_SHIP_ENABLED: "true"
+      LOG_SHIP_PATH: /app/data_v2/logs/worker.jsonl
+      MODEL_MODE: ${MODEL_MODE:-auto}
+      EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-m3}
+      EMBED_API_KEY: ${EMBED_API_KEY:-${API_KEY_SILICON:-}}
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-https://api.siliconflow.cn/v1}
+      CHAT_MODEL: ${CHAT_MODEL:-deepseek-flash}
+      CHAT_API_KEY: ${CHAT_API_KEY:-${DEEPSEEK_API_KEY:-}}
+      CHAT_BASE_URL: ${CHAT_BASE_URL:-https://api.deepseek.com}
+      CHUNK_SIZE: ${CHUNK_SIZE:-450}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-80}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: qdrant,postgres,redis,minio,elasticsearch,logstash,localhost,127.0.0.1
+    volumes:
+      - app_logs:/app/data_v2/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [ragnet]
+
+  # ---------------- P4 ELK ----------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: rag_p4_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - xpack.ml.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - bootstrap.memory_lock=true
+      - TZ=Asia/Shanghai
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "${ES_PORT:-9200}:9200"
+    networks: [ragnet]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?pretty' | grep -qE 'green|yellow' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    container_name: rag_p4_logstash
+    restart: unless-stopped
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.monitoring.enabled=false
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./deploy/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - app_logs:/var/log/rag-kb:ro
+      - logstash_data:/usr/share/logstash/data
+    networks: [ragnet]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9600/_node/stats >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: rag_p4_kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      I18N_LOCALE: zh-CN
+      SERVER_PUBLICBASEURL: ${KIBANA_PUBLIC_URL:-http://localhost:5601}
+      TELEMETRY_ENABLED: "false"
+      TZ: Asia/Shanghai
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+    networks: [ragnet]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5601/api/status | grep -q 'available' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+
+  # ---------------- P4 告警评估器 ----------------
+  # 为什么单独一个容器，而不是让 api 自己评估：
+  # `docker compose up --scale api=3` 之后，三个副本会各跑一份评估线程，
+  # 同一次故障被投递三次。用 alert_silences 表去重挡不住重复**落库**——
+  # 三个副本几乎同时判定超标、同时查静默（都读到"无静默"）、同时写入，
+  # 这是 check-then-act 竞态，加唯一约束也解决不了（窗口内本就可再次触发）。
+  # 正确做法不是加锁，而是只让一个进程评估。
+  alert:
+    build:
+      context: ..
+      dockerfile: app_v2/Dockerfile
+    container_name: rag_p4_alert
+    restart: unless-stopped
+    # 不跑 uvicorn，只跑评估循环。复用同一镜像，避免多维护一个 Dockerfile。
+    command: ["python", "-m", "app_v2.worker.alert_runner"]
+    environment:
+      ENV: ${ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      VECTOR_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      COLLECTION_NAME: ${COLLECTION_NAME:-kb_chunks}
+      META_BACKEND: postgres
+      DATABASE_URL: postgresql://${PG_USER:-raguser}:${PG_PASSWORD:-ragpass123}@postgres:5432/${PG_DB:-rag_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_ENABLED: "true"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_URL: redis://redis:6379/1
+      # webhook 告警走队列投递，所以这里**不能**开 eager：开了等于同步阻塞评估循环
+      CELERY_EAGER: "false"
+      MINIO_ENABLED: ${MINIO_ENABLED:-true}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-ragadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-ragminio2026}
+      MINIO_BUCKET: ${MINIO_BUCKET:-rag-documents}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      ALERT_ENABLED: ${ALERT_ENABLED:-true}
+      # 单点服务，评估必须在进程内跑
+      ALERT_EVAL_IN_PROCESS: "true"
+      ALERT_EVAL_INTERVAL_SEC: ${ALERT_EVAL_INTERVAL_SEC:-60}
+      ALERT_SILENCE_SEC: ${ALERT_SILENCE_SEC:-300}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_TIMEOUT: ${ALERT_WEBHOOK_TIMEOUT:-5}
+      ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-}
+      ALERT_SMTP_PORT: ${ALERT_SMTP_PORT:-465}
+      ALERT_SMTP_USER: ${ALERT_SMTP_USER:-}
+      ALERT_SMTP_PASSWORD: ${ALERT_SMTP_PASSWORD:-}
+      ALERT_SMTP_FROM: ${ALERT_SMTP_FROM:-}
+      ALERT_MAIL_TO: ${ALERT_MAIL_TO:-}
+      LOG_SHIP_ENABLED: "true"
+      LOG_SHIP_PATH: /app/data_v2/logs/alert.jsonl
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: qdrant,postgres,redis,minio,elasticsearch,logstash,localhost,127.0.0.1
+    volumes:
+      - app_logs:/app/data_v2/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+volumes:
+  qdrant_data:
+    name: rag_p4_qdrant_data
+  pg_data:
+    name: rag_p3_pg_data
+  redis_data:
+    name: rag_p4_redis_data
+  prometheus_data:
+    name: rag_p4_prometheus_data
+  grafana_data:
+    name: rag_p4_grafana_data
+  minio_data:
+    name: rag_p4_minio_data
+  es_data:
+    name: rag_p4_es_data
+  logstash_data:
+    name: rag_p4_logstash_data
+  # 应用日志卷：api 与 worker 写，logstash 只读。
+  # 用一个共享卷而不是各自挂宿主机目录，是为了跨平台（Windows 下路径映射易出错）。
+  app_logs:
+    name: rag_p4_app_logs
+
+networks:
+  ragnet:
+    name: rag_p3_net
+    driver: bridge

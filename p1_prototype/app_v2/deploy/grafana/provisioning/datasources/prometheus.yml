@@ -1,0 +1,15 @@
+# Grafana 数据源自动装配：容器启动即生效，无需手工点界面
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+      # 与 Prometheus 的 external_labels 对齐，面板里可直接按 cluster 过滤
+      exemplarTraceIdDestinations: []
